@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.venv/
+venv/
+.env
+.env.*
+*.egg-info/
+build/
+dist/
+
+# Logs
+*.log
+
+# Editors/OS
+.DS_Store
+.vscode/
+.idea/
+
+# Misc
+*.swp
+*.swo
