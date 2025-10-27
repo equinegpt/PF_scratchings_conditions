@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: pf-updates
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PF_API_KEY
+        # set this in the Render dashboard as a Secret (leave value blank here)
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
+
+cronJobs:
+  - name: prewarm-auto-15min
+    schedule: "*/15 * * * *"   # every 15 minutes (UTC)
+    command: >
+      curl -fsS -X POST https://YOUR-SERVICE.onrender.com/tasks/prewarm/auto -o /dev/null

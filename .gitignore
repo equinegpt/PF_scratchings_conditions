@@ -4,22 +4,15 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.egg-info/
+.eggs/
+
+# Virtual envs
 .venv/
 venv/
-.env
-.env.*
-*.egg-info/
-build/
-dist/
+env/
 
-# Logs
-*.log
-
-# Editors/OS
+# OS / editor
 .DS_Store
-.vscode/
 .idea/
-
-# Misc
-*.swp
-*.swo
+.vscode/

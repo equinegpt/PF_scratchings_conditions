@@ -1,9 +1,9 @@
 # pf_updates.py
 # Aggregates PF Updates (Conditions + Scratchings) by meeting/race.
-# - Robust rating parsing (Good/Soft/Heavy/Firm/Dead/Slow + codes + Synthetic)
-# - Name/ID-based mapping within (meeting_id, race_number)
-# - runner_number optional (backfilled when available via form/fields endpoints)
-# - Proper CSV parsing for PF CSV endpoints
+# - Prefer freshest track_condition (try Updates with meetingId, then JSON/CSV backfills)
+# - Augment scratchings from "fields" index so you get ALL scratched runners
+# - Name-based identity within (meeting_id, race_number)
+# - runner_number optional (backfilled when available)
 # Python 3.9 compatible.
 
 import os
@@ -15,7 +15,7 @@ import asyncio
 import httpx
 from datetime import datetime, timezone
 from dateutil import tz
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Updates
 PF_SCR_URL = "https://api.puntingform.com.au/v2/Updates/Scratchings"
@@ -56,7 +56,7 @@ FIELD_ALIASES = {
         "tabno", "tab_number", "cloth", "cloth_number",
     },
     "horse_name": {"horse", "horse_name", "runnername", "name"},
-    # conditions  (IMPORTANT: do NOT include generic "track" here)
+    # conditions (do NOT include generic "track")
     "track_condition": {"track_condition", "trackrating", "track_rating", "rating", "condition", "rating_code"},
     "weather": {"weather", "weather_desc", "weatherdescription"},
     "rail": {"rail", "rail_position", "railposition"},
@@ -81,9 +81,26 @@ def _canonise(d: Dict[str, Any]) -> Dict[str, Any]:
 def _parse_int(x: Any) -> Optional[int]:
     try:
         v = int(x)
-        return v if v != 0 else None  # PF sometimes uses 0 as "unknown"
+        return v if v != 0 else None
     except Exception:
         return None
+
+def _parse_bool(x: Any) -> Optional[bool]:
+    if x is None: return None
+    if isinstance(x, bool): return x
+    s = str(x).strip().lower()
+    if s in {"1", "true", "y", "yes", "t"}: return True
+    if s in {"0", "false", "n", "no", "f"}: return False
+    return None
+
+def _norm_venue(v: Optional[str]) -> Optional[str]:
+    if not v: return None
+    s = str(v)
+    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"\b(racecourse|racetrack)\b", "", s, flags=re.I)
+    s = re.sub(r"[^a-zA-Z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s or None
 
 def _to_mel_dt(x: Any) -> Optional[datetime]:
     if not x:
@@ -99,37 +116,20 @@ def _to_mel_dt(x: Any) -> Optional[datetime]:
     return dt.astimezone(MEL_TZ)
 
 def _display_track_condition(raw: Optional[str]) -> Optional[str]:
-    """
-    Accept AUS/NZ ratings:
-      - Word forms: Good4, Soft7, Heavy10, Firm2, Dead5, Slow6 (case-insensitive; spaces ok)
-      - Code forms: G4, S7, H10, F2, D5, SL6
-      - Surfaces without numbers: Synthetic, Polytrack, Tapeta, All Weather, AW, Syn
-    Strip any bracketed suffixes like 'Good 4 (morning)'.
-    """
-    if not raw:
-        return None
+    if not raw: return None
     s = str(raw).strip()
-    s = re.sub(r"\([^)]*\)", "", s).strip()  # remove bracketed notes
-
-    # Surfaces (no number)
+    s = re.sub(r"\([^)]*\)", "", s).strip()
     if re.fullmatch(r"(?i)(synthetic|polytrack|tapeta|all\s*weather|aw|syn)", s):
         return "Synthetic"
-
-    # Code forms: G4, S7, H10, F2, D5, SL6
     m_code = re.fullmatch(r"\s*([GFHDSLgfhdsl])\s*([0-9]{1,2})\s*", s)
     if m_code:
-        letter = m_code.group(1).lower()
-        num = m_code.group(2)
         table = {"g": "Good", "s": "Soft", "h": "Heavy", "f": "Firm", "d": "Dead", "l": "Slow"}
-        label = table.get(letter)
+        label = table.get(m_code.group(1).lower())
         if label:
-            return f"{label}{num}"
-
-    # Word forms
+            return f"{label}{m_code.group(2)}"
     m = re.search(r"(?i)\b(Good|Soft|Heavy|Firm|Dead|Slow)\s*([0-9]{1,2})\b", s)
     if m:
         return f"{m.group(1).capitalize()}{m.group(2)}"
-
     return None
 
 def _extract_track_condition(cond: Dict[str, Any], venue: Optional[str]) -> Optional[str]:
@@ -149,18 +149,15 @@ def _extract_track_condition(cond: Dict[str, Any], venue: Optional[str]) -> Opti
         cond.get("surface"),
     ]
     for c in candidates:
-        if not c:
-            continue
+        if not c: continue
         if v_norm and str(c).strip().lower() == v_norm:
             continue
         tc = _display_track_condition(c)
-        if tc:
-            return tc
+        if tc: return tc
     return None
 
 def _norm_name(name: Optional[str]) -> Optional[str]:
-    if not name:
-        return None
+    if not name: return None
     s = unicodedata.normalize("NFKD", str(name))
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
     s = s.lower()
@@ -193,8 +190,7 @@ async def _pf_get_json(url: str, timeout: float = 20.0, extra_params: Optional[D
                 r = await _http_get(client, url, headers, params)
                 if r.status_code == 200:
                     payload = r.json()
-                    if isinstance(payload, list):
-                        return payload
+                    if isinstance(payload, list): return payload
                     if isinstance(payload, dict):
                         if "statusCode" in payload and payload.get("statusCode") not in (200, 201, None):
                             last_err = f"{payload.get('statusCode')} {payload.get('error')}"
@@ -246,12 +242,12 @@ async def _pf_get_csv(url: str, timeout: float = 20.0, extra_params: Optional[Di
                 continue
         return []
 
-# Back-compat alias (used by /debug/raw)
+# Back-compat alias (older main.py debug imports)
 async def _pf_get(url: str, timeout: float = 20.0, extra_params: Optional[Dict[str, Any]] = None):
     return await _pf_get_json(url, timeout=timeout, extra_params=extra_params)
 
 # ----------------------------
-# Backfill caches (optional) — for runner number/name lookups
+# Backfill caches (fields index)
 # ----------------------------
 
 _FIELDS_ID_INDEX: Dict[int, Dict[int, Dict[str, Any]]] = {}
@@ -263,11 +259,13 @@ def _index_add(meeting_id: int, row: Dict[str, Any]):
     rn  = _parse_int(row.get("runner_number"))
     nm  = row.get("horse_name")
     rno = _parse_int(row.get("race_number"))
+    scr = _parse_bool(row.get("scratched"))
 
     rec = {
         "runner_number": rn,
         "horse_name": nm,
         "race_number": rno,
+        "scratched": scr,
         "runner_id": rid,
     }
     if rid is not None:
@@ -277,11 +275,10 @@ def _index_add(meeting_id: int, row: Dict[str, Any]):
         _FIELDS_NAME_INDEX.setdefault(meeting_id, {}).setdefault(nkey, []).append(rec)
 
 async def _fetch_meeting_fields(meeting_id: int, venue: Optional[str], meeting_date: Optional[str]) -> None:
-    """Populate caches for an entire meeting using several strategies, incl. CSV."""
     if meeting_id in _FIELDS_ID_INDEX:
         return
 
-    # 1) meeting/csv by meetingId  (CSV)
+    # 1) meeting/csv by meetingId
     try:
         rows = await _pf_get_csv(PF_MEETING_CSV_URL, extra_params={"meetingId": meeting_id})
         for raw in rows or []:
@@ -289,7 +286,7 @@ async def _fetch_meeting_fields(meeting_id: int, venue: Optional[str], meeting_d
     except Exception:
         pass
 
-    # 2) form/form by meetingId (raceNumber=0 -> all races)  (JSON)
+    # 2) form/form by meetingId (raceNumber=0 -> all races)
     if meeting_id not in _FIELDS_ID_INDEX:
         try:
             rows = await _pf_get_json(PF_FORM_URL, extra_params={"meetingId": meeting_id, "raceNumber": 0})
@@ -313,7 +310,7 @@ async def _fetch_meeting_fields(meeting_id: int, venue: Optional[str], meeting_d
         except Exception:
             pass
 
-    # 3/4/5) date+venue fallbacks (try normalised venue too)
+    # 3/4/5) date+venue fallbacks
     if meeting_id not in _FIELDS_ID_INDEX and venue and meeting_date:
         date_keys = ["meetingDate", "meeting_date", "date"]
         venue_keys = ["venue", "track", "course", "meeting"]
@@ -379,26 +376,22 @@ async def _fetch_meeting_fields(meeting_id: int, venue: Optional[str], meeting_d
 
 async def _build_runner_index_for_meeting(meeting_id: int, races_needed: Set[int], venue: Optional[str], meeting_date: Optional[str]) -> Dict[int, Dict[str, Any]]:
     await _fetch_meeting_fields(meeting_id, venue, meeting_date)
-    # top-up any missing race with race-level fields (JSON first; CSV fallback)
     have_idx = _FIELDS_ID_INDEX.get(meeting_id, {})
     missing_races: List[int] = []
     for rno in sorted(races_needed):
         if not any(v.get("race_number") == rno for v in have_idx.values() if isinstance(v, dict)):
             missing_races.append(rno)
 
-    # JSON race fields
     if missing_races:
         results = await asyncio.gather(*(
             _pf_get_json(PF_FIELDS_JSON_URL, extra_params={"meetingId": meeting_id, "raceNumber": r})
             for r in missing_races
         ), return_exceptions=True)
         for rows in results:
-            if isinstance(rows, Exception):
-                continue
+            if isinstance(rows, Exception): continue
             for raw in rows or []:
                 _index_add(meeting_id, raw)
 
-    # CSV race fields (last resort)
     have_idx = _FIELDS_ID_INDEX.get(meeting_id, {})
     still_missing: List[int] = []
     for rno in sorted(missing_races):
@@ -410,36 +403,33 @@ async def _build_runner_index_for_meeting(meeting_id: int, races_needed: Set[int
             for r in still_missing
         ), return_exceptions=True)
         for rows in results:
-            if isinstance(rows, Exception):
-                continue
+            if isinstance(rows, Exception): continue
             for raw in rows or []:
                 _index_add(meeting_id, raw)
 
     return _FIELDS_ID_INDEX.get(meeting_id, {})
 
 # ----------------------------
-# Track condition backfill (scan JSON first, then CSV)
+# Date filter
 # ----------------------------
 
-def _norm_venue(v: Optional[str]) -> Optional[str]:
-    if not v:
-        return None
-    s = str(v)
-    s = re.sub(r"\(.*?\)", "", s)            # drop parenthetical notes
-    s = re.sub(r"\b(racecourse|racetrack)\b", "", s, flags=re.I)
-    s = re.sub(r"[^a-zA-Z0-9]+", " ", s)     # punctuation -> space
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s or None
+def _same_day_mel(dt_str: Optional[str], target_date: str) -> bool:
+    if not target_date: return True
+    if dt_str and re.match(r"^\d{4}-\d{2}-\d{2}$", str(dt_str)):
+        return str(dt_str) == target_date
+    return True
+
+# ----------------------------
+# Conditions backfill (prefer freshest)
+# ----------------------------
 
 def _scan_for_rating(value: Any, venue: Optional[str]) -> Optional[str]:
     v_norm = (str(venue or "").strip().lower() or None)
 
     def _check_str(s: str) -> Optional[str]:
         s2 = s.strip()
-        if not s2:
-            return None
-        if v_norm and s2.lower() == v_norm:
-            return None
+        if not s2: return None
+        if v_norm and s2.lower() == v_norm: return None
         return _display_track_condition(s2)
 
     if isinstance(value, str):
@@ -448,18 +438,27 @@ def _scan_for_rating(value: Any, venue: Optional[str]) -> Optional[str]:
         for _k, v in value.items():
             if isinstance(v, str):
                 tc = _check_str(v)
-                if tc:
-                    return tc
+                if tc: return tc
             tc = _scan_for_rating(v, venue)
-            if tc:
-                return tc
+            if tc: return tc
         return None
     if isinstance(value, list):
         for it in value:
             tc = _scan_for_rating(it, venue)
+            if tc: return tc
+        return None
+    return None
+
+async def _try_meeting_condition_from_updates(mid: int) -> Optional[str]:
+    """Try Updates/Conditions narrowed to meetingId (often most current)."""
+    try:
+        rows = await _pf_get_json(PF_COND_URL, extra_params={"meetingId": mid})
+        for r in rows or []:
+            tc = _extract_track_condition(_canonise(r), r.get("venue"))
             if tc:
                 return tc
-        return None
+    except Exception:
+        pass
     return None
 
 async def _try_meeting_condition_from_json(meeting_id: int, venue: Optional[str], meeting_date: Optional[str]) -> Optional[str]:
@@ -468,8 +467,7 @@ async def _try_meeting_condition_from_json(meeting_id: int, venue: Optional[str]
         for obj in rows or []:
             if isinstance(obj, dict):
                 tc = _scan_for_rating(obj, venue)
-                if tc:
-                    return tc
+                if tc: return tc
     except Exception:
         pass
     if meeting_date and venue:
@@ -485,8 +483,7 @@ async def _try_meeting_condition_from_json(meeting_id: int, venue: Optional[str]
                         rows = await _pf_get_json(PF_FIELDS_JSON_URL, extra_params={dk: meeting_date, vk: vtry})
                         for obj in rows or []:
                             tc = _scan_for_rating(obj, venue)
-                            if tc:
-                                return tc
+                            if tc: return tc
                     except Exception:
                         continue
     return None
@@ -496,8 +493,7 @@ async def _try_meeting_condition_from_csv(meeting_id: int, venue: Optional[str],
         rows = await _pf_get_csv(PF_MEETING_CSV_URL, extra_params={"meetingId": meeting_id})
         for row in rows or []:
             tc = _scan_for_rating(row, venue)
-            if tc:
-                return tc
+            if tc: return tc
     except Exception:
         pass
     if meeting_date and venue:
@@ -513,79 +509,180 @@ async def _try_meeting_condition_from_csv(meeting_id: int, venue: Optional[str],
                         rows = await _pf_get_csv(PF_MEETING_CSV_URL, extra_params={dk: meeting_date, vk: vtry})
                         for row in rows or []:
                             tc = _scan_for_rating(row, venue)
-                            if tc:
-                                return tc
+                            if tc: return tc
                     except Exception:
                         continue
                     try:
                         rows = await _pf_get_csv(PF_FIELDS_CSV_URL, extra_params={dk: meeting_date, vk: vtry})
                         for row in rows or []:
                             tc = _scan_for_rating(row, venue)
-                            if tc:
-                                return tc
+                            if tc: return tc
                     except Exception:
                         continue
     return None
 
 async def _backfill_track_condition_for_meetings(meetings: Dict[int, Dict[str, Any]], target_date: str) -> None:
-    todo: List[Dict[str, Any]] = []
+    """Prefer Updates(meetingId) → JSON → CSV."""
+    todo: List[Tuple[int, Dict[str, Any]]] = []
     for mid, m in meetings.items():
         cond = m.get("conditions")
         if (cond is None) or (cond and not cond.get("track_condition")):
-            todo.append({"mid": mid, "m": m, "venue": m.get("venue"), "mdate": m.get("meeting_date") or target_date})
+            todo.append((mid, m))
+
     if not todo:
         return
-    json_results = await asyncio.gather(*(
-        _try_meeting_condition_from_json(t["mid"], t["venue"], t["mdate"])
-        for t in todo
+
+    # Updates/Conditions scoped by meetingId (freshest)
+    upd_results = await asyncio.gather(*(
+        _try_meeting_condition_from_updates(mid) for mid, _ in todo
     ), return_exceptions=True)
-    still: List[Dict[str, Any]] = []
-    for t, res in zip(todo, json_results):
-        m = t["m"]
+
+    still: List[Tuple[int, Dict[str, Any]]] = []
+    for (mid, m), res in zip(todo, upd_results):
+        cond = m.get("conditions") or {"weather": None, "track_condition": None, "rail": None, "updated_at": None}
         if not isinstance(res, Exception) and res:
-            if not m.get("conditions"):
-                m["conditions"] = {"weather": None, "track_condition": res, "rail": None, "updated_at": None}
-            else:
-                m["conditions"]["track_condition"] = res
+            cond["track_condition"] = res
+            m["conditions"] = cond
         else:
-            still.append(t)
+            still.append((mid, m))
+
     if not still:
         return
-    csv_results = await asyncio.gather(*(
-        _try_meeting_condition_from_csv(t["mid"], t["venue"], t["mdate"])
-        for t in still
+
+    # JSON then CSV
+    json_results = await asyncio.gather(*(
+        _try_meeting_condition_from_json(mid, m.get("venue"), m.get("meeting_date") or target_date)
+        for mid, m in still
     ), return_exceptions=True)
-    for t, res in zip(still, csv_results):
-        m = t["m"]
+
+    still2: List[Tuple[int, Dict[str, Any]]] = []
+    for (mid, m), res in zip(still, json_results):
+        cond = m.get("conditions") or {"weather": None, "track_condition": None, "rail": None, "updated_at": None}
         if not isinstance(res, Exception) and res:
-            if not m.get("conditions"):
-                m["conditions"] = {"weather": None, "track_condition": res, "rail": None, "updated_at": None}
-            else:
-                m["conditions"]["track_condition"] = res
+            cond["track_condition"] = res
+            m["conditions"] = cond
+        else:
+            still2.append((mid, m))
+
+    if not still2:
+        return
+
+    csv_results = await asyncio.gather(*(
+        _try_meeting_condition_from_csv(mid, m.get("venue"), m.get("meeting_date") or target_date)
+        for mid, m in still2
+    ), return_exceptions=True)
+
+    for (mid, m), res in zip(still2, csv_results):
+        cond = m.get("conditions") or {"weather": None, "track_condition": None, "rail": None, "updated_at": None}
+        if not isinstance(res, Exception) and res:
+            cond["track_condition"] = res
+            m["conditions"] = cond
 
 # ----------------------------
-# Filters
+# Fetch helpers that try multiple query patterns (date-aware)
 # ----------------------------
 
-def _same_day_mel(dt_str: Optional[str], target_date: str) -> bool:
-    if not target_date:
-        return True
-    if dt_str and re.match(r"^\d{4}-\d{2}-\d{2}$", str(dt_str)):
-        return str(dt_str) == target_date
-    return True
+async def _fetch_updates_scratchings_for_date(target_date: str) -> List[Dict[str, Any]]:
+    tries = [
+        {},  # no filter (some PF stacks return full day by default)
+        {"date": target_date},
+        {"meetingDate": target_date},
+        {"date_from": target_date, "date_to": target_date},
+        {"startDate": target_date, "endDate": target_date},
+    ]
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for p in tries:
+        try:
+            rows = await _pf_get_json(PF_SCR_URL, extra_params=p)
+            for r in rows or []:
+                c = _canonise(r)
+                key = (c.get("meeting_id"), c.get("race_number"), c.get("runner_id"), _norm_name(c.get("horse_name")))
+                if key not in seen:
+                    seen.add(key)
+                    out.append(c)
+        except Exception:
+            continue
+    return out
+
+async def _fetch_updates_conditions_for_date(target_date: str) -> List[Dict[str, Any]]:
+    tries = [
+        {},
+        {"date": target_date},
+        {"meetingDate": target_date},
+        {"date_from": target_date, "date_to": target_date},
+        {"startDate": target_date, "endDate": target_date},
+    ]
+    seen = set()
+    out: List[Dict[str, Any]] = []
+    for p in tries:
+        try:
+            rows = await _pf_get_json(PF_COND_URL, extra_params=p)
+            for r in rows or []:
+                c = _canonise(r)
+                key = (c.get("meeting_id"), c.get("updated_at"))
+                if key not in seen:
+                    seen.add(key)
+                    out.append(c)
+        except Exception:
+            continue
+    return out
+
+# ----------------------------
+# Augment scratchings from fields (ensures ALL scratched runners appear)
+# ----------------------------
+
+def _ensure_race(meeting_obj: Dict[str, Any], rno: int) -> Dict[str, Any]:
+    race = meeting_obj["races"].get(rno)
+    if not race:
+        race = {"race_number": rno, "scratchings": []}
+        meeting_obj["races"][rno] = race
+    return race
+
+def _exists_in_scratch_list(lst: List[Dict[str, Any]], rid: Optional[int], nm: Optional[str]) -> bool:
+    nkey = _norm_name(nm) or ""
+    for e in lst:
+        if rid and e.get("runner_id") == rid:
+            return True
+        if (nkey and _norm_name(e.get("horse_name") or "") == nkey):
+            return True
+    return False
+
+async def _augment_scratchings_from_fields(meetings: Dict[int, Dict[str, Any]], target_date: str) -> None:
+    # Build a set of races per meeting that we’ll want to inspect
+    for mid, m in meetings.items():
+        # Load fields index
+        await _fetch_meeting_fields(mid, m.get("venue"), m.get("meeting_date") or target_date)
+        id_idx = _FIELDS_ID_INDEX.get(mid, {})
+        # Infer all race_numbers from index
+        race_numbers = set(m["races"].keys()) | {info.get("race_number") for info in id_idx.values() if info.get("race_number") is not None}
+        # For each race, add any runner where fields say scratched == True but we don't already have it
+        for rno in sorted(r for r in race_numbers if r is not None):
+            race = _ensure_race(m, rno)
+            for rid, info in id_idx.items():
+                if info.get("race_number") != rno:
+                    continue
+                if info.get("scratched") is True:
+                    nm = info.get("horse_name")
+                    rn = info.get("runner_number")
+                    if not _exists_in_scratch_list(race["scratchings"], rid, nm):
+                        race["scratchings"].append({
+                            "runner_number": rn,
+                            "horse_name": nm,
+                            "runner_id": rid,
+                            "updated_at": None,
+                        })
+            # keep tidy ordering
+            race["scratchings"].sort(key=lambda x: (x["runner_number"] is None, x["runner_number"] or 0, (x["horse_name"] or "").lower()))
 
 # ----------------------------
 # Public: main fetch
 # ----------------------------
 
 async def fetch_updates_for_date(target_date: str) -> Dict[str, Any]:
-    scratches_raw, cond_raw = await asyncio.gather(
-        _pf_get_json(PF_SCR_URL),
-        _pf_get_json(PF_COND_URL),
-    )
-
-    scratches = [_canonise(x) for x in scratches_raw]
-    conditions = [_canonise(x) for x in cond_raw]
+    # Use broader “date-aware” pulls to reduce partial-days
+    scratches = await _fetch_updates_scratchings_for_date(target_date)
+    conditions = await _fetch_updates_conditions_for_date(target_date)
 
     scratches_f = [s for s in scratches if _same_day_mel(s.get("meeting_date"), target_date)]
     cond_f      = [c for c in conditions if _same_day_mel(c.get("meeting_date"), target_date)]
@@ -623,8 +720,7 @@ async def fetch_updates_for_date(target_date: str) -> Dict[str, Any]:
         if not m.get("state"): m["state"] = c.get("state")
         if not m.get("meeting_date"): m["meeting_date"] = c.get("meeting_date")
 
-    # Scratchings
-    needs_backfill: Dict[int, Set[int]] = {}
+    # Scratchings from Updates
     for s in scratches_f:
         mid = _parse_int(s.get("meeting_id"))
         if mid is None:
@@ -660,9 +756,6 @@ async def fetch_updates_for_date(target_date: str) -> Dict[str, Any]:
         if not entry["horse_name"] and not entry["runner_id"]:
             continue
 
-        if entry["runner_id"] and (entry["runner_number"] is None or not entry["horse_name"]):
-            needs_backfill.setdefault(mid, set()).add(race_no)
-
         name_key = (race_no, (_norm_name(entry["horse_name"]) or ""))
         idx_map = {(race_no, (_norm_name(e.get("horse_name")) or "")): i
                    for i, e in enumerate(race["scratchings"])}
@@ -682,29 +775,10 @@ async def fetch_updates_for_date(target_date: str) -> Dict[str, Any]:
         if not m.get("state"): m["state"] = s.get("state")
         if not m.get("meeting_date"): m["meeting_date"] = s.get("meeting_date")
 
-    # Backfill runner_number/name for scratchings (lightweight)
-    for mid, race_set in needs_backfill.items():
-        m = meetings.get(mid) or {}
-        id_idx = await _build_runner_index_for_meeting(mid, race_set, m.get("venue"), m.get("meeting_date") or target_date)
-        name_idx = _FIELDS_NAME_INDEX.get(mid, {})
-        for r in m.get("races", {}).values():
-            rno = r["race_number"]
-            for e in r["scratchings"]:
-                if e.get("runner_id"):
-                    info = id_idx.get(e["runner_id"])
-                    if info:
-                        if e.get("runner_number") is None and info.get("runner_number") is not None:
-                            e["runner_number"] = info["runner_number"]
-                        if not e.get("horse_name") and info.get("horse_name"):
-                            e["horse_name"] = info["horse_name"]
-                if e.get("runner_number") is None and e.get("horse_name"):
-                    k = _norm_name(e["horse_name"])
-                    if k and k in name_idx:
-                        cands = [c for c in name_idx[k] if c.get("race_number") == rno] or name_idx[k]
-                        if cands and cands[0].get("runner_number") is not None:
-                            e["runner_number"] = cands[0]["runner_number"]
+    # Augment scratchings from fields so you get ALL scratched runners
+    await _augment_scratchings_from_fields(meetings, target_date)
 
-    # Backfill missing track_condition from PF JSON/CSV (if Updates/Conditions didn't have it)
+    # Fill missing / stale track_condition using Updates(meetingId) → JSON → CSV
     await _backfill_track_condition_for_meetings(meetings, target_date)
 
     # Materialise
