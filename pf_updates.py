@@ -842,3 +842,34 @@ async def fetch_updates_for_date(target_date: str) -> Dict[str, Any]:
         })
 
     return {"date": target_date, "meetings": meetings_out}
+
+# -------------- Convenience wrappers: split crawlers -----------------
+
+async def fetch_scratchings_for_date(target_date: str) -> Dict[str, Any]:
+    """
+    Returns only scratchings grouped by meeting/race.
+    Uses the same robust de-dupe + backfill implemented in fetch_updates_for_date.
+    """
+    data = await fetch_updates_for_date(target_date)
+    # strip conditions so this endpoint is scratchings-only
+    for m in data.get("meetings", []):
+        m.pop("conditions", None)
+    return data
+
+
+async def fetch_conditions_for_date(target_date: str) -> Dict[str, Any]:
+    """
+    Returns only conditions per meeting (no races).
+    Still benefits from the rating backfill logic in fetch_updates_for_date.
+    """
+    data = await fetch_updates_for_date(target_date)
+    meetings_out = []
+    for m in data.get("meetings", []):
+        meetings_out.append({
+            "meeting_id": m.get("meeting_id"),
+            "venue": m.get("venue"),
+            "state": m.get("state"),
+            "conditions": m.get("conditions"),
+            "races": [],  # omit races in this view
+        })
+    return {"date": target_date, "meetings": meetings_out}
