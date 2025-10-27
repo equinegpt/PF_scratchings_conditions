@@ -12,12 +12,12 @@ from pf_updates import fetch_updates_for_date
 # Debug helpers (from pf_updates.py)
 from pf_updates import _pf_get, PF_SCR_URL, PF_COND_URL
 
-app = FastAPI(title="PF Updates Aggregator", version="1.3")
+app = FastAPI(title="PF Updates Aggregator", version="1.3.1")
 
 MEL_TZ = tz.gettz("Australia/Melbourne")
 
 # ---------------------------------------------------------------------
-# CORS (open; lock down allow_origins if needed)
+# CORS
 # ---------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -87,7 +87,12 @@ async def get_snapshot(date_str: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"ok": True, "hint": "See /docs for available endpoints."}
+    return {
+        "ok": True,
+        "hint": "See /docs",
+        "useful": ["/updates/daily?date=YYYY-MM-DD", "/tasks/prewarm", "/tasks/prewarm/auto",
+                   "/snapshot/today", "/snapshot/2025-10-27"]
+    }
 
 @app.get("/healthz")
 async def healthz():
@@ -156,7 +161,7 @@ async def prewarm_auto():
         PREWARM_MARKS[d][h] = True
         ran = True
 
-    # tidy old marks (keep a couple of days)
+    # tidy old marks
     keep = sorted(PREWARM_MARKS.keys())[-3:]
     for k in list(PREWARM_MARKS.keys()):
         if k not in keep:
@@ -164,17 +169,18 @@ async def prewarm_auto():
 
     return {"date": d, "hour": h, "ran": ran, "done_today": PREWARM_MARKS.get(d)}
 
+# IMPORTANT: define static route BEFORE dynamic route
+@app.get("/snapshot/today")
+async def snapshot_today():
+    try:
+        return await get_snapshot(mel_today_str())
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"PF fetch failed: {e}")
+
 @app.get("/snapshot/{date}")
 async def snapshot_date(date: str = Path(..., pattern=r"^\d{4}-\d{2}-\d{2}$")):
     """Return cached snapshot for a date; if missing, compute and cache it."""
     try:
         return await get_snapshot(date)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"PF fetch failed: {e}")
-
-@app.get("/snapshot/today")
-async def snapshot_today():
-    try:
-        return await get_snapshot(mel_today_str())
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"PF fetch failed: {e}")
