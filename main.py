@@ -1,25 +1,23 @@
 # main.py (FastAPI entrypoint, Python 3.9+ compatible)
-
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, Query, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
 from datetime import datetime
 from dateutil import tz
 
-# Aggregators (from pf_updates.py)
-from pf_updates import fetch_updates_for_date, fetch_gear_for_date
+# Aggregator (from pf_updates.py)
+from pf_updates import fetch_updates_for_date
 
 # Debug helpers (from pf_updates.py)
 from pf_updates import _pf_get, PF_SCR_URL, PF_COND_URL
 
-app = FastAPI(title="PF Updates Aggregator", version="1.2")
+app = FastAPI(title="PF Updates Aggregator", version="1.3")
 
 MEL_TZ = tz.gettz("Australia/Melbourne")
 
 # ---------------------------------------------------------------------
-# CORS (open by default; lock down allow_origins if you want)
+# CORS (open; lock down allow_origins if needed)
 # ---------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -58,27 +56,6 @@ class MeetingOut(BaseModel):
 class UpdatesOut(BaseModel):
     date: str
     meetings: List[MeetingOut]
-
-# --- Gear models (non-scratched runners only) ---
-class GearRunner(BaseModel):
-    runner_number: Optional[int] = None
-    horse_name: Optional[str] = None
-    runner_id: Optional[int] = None
-    gear_changes: Optional[str] = None
-
-class RaceGearOut(BaseModel):
-    race_number: int
-    runners: List[GearRunner]
-
-class MeetingGearOut(BaseModel):
-    meeting_id: int
-    venue: Optional[str] = None
-    state: Optional[str] = None
-    races: List[RaceGearOut]
-
-class GearOut(BaseModel):
-    date: str
-    meetings: List[MeetingGearOut]
 
 # ---------------------------------------------------------------------
 # Simple in-memory snapshot cache + helpers
@@ -131,24 +108,6 @@ async def updates_daily(
         data["meetings"] = [m for m in data["meetings"] if m.get("meeting_id") == meeting_id]
     return data
 
-@app.get("/gear/daily", response_model=GearOut)
-async def gear_daily(
-    date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    meeting_id: Optional[int] = Query(None),
-):
-    """
-    Gear changes per horse, per race — for runners only (scratchings excluded).
-    Separate from /updates/daily and does not modify that response.
-    """
-    try:
-        data = await fetch_gear_for_date(date)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"PF gear fetch failed: {e}")
-
-    if meeting_id is not None:
-        data["meetings"] = [m for m in data["meetings"] if m.get("meeting_id") == meeting_id]
-    return data
-
 @app.get("/debug/raw")
 async def debug_raw(which: str = Query(..., pattern="^(scratchings|conditions)$")):
     """Return raw PF payload so we can see exactly what PF sends back."""
@@ -169,9 +128,7 @@ async def debug_counts(date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$")):
 # Prewarm + snapshot (for twice-daily "crawl")
 # ---------------------------------------------------------------------
 @app.post("/tasks/prewarm")
-async def prewarm(
-    date: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$"),
-):
+async def prewarm(date: Optional[str] = Query(None, pattern=r"^\d{4}-\d{2}-\d{2}$")):
     """Build & cache a snapshot for a date (or today if omitted)."""
     d = date or mel_today_str()
     try:
@@ -208,13 +165,8 @@ async def prewarm_auto():
     return {"date": d, "hour": h, "ran": ran, "done_today": PREWARM_MARKS.get(d)}
 
 @app.get("/snapshot/{date}")
-async def snapshot_date(
-    date: str = Path(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
-):
-    """
-    Return cached snapshot for a date if present; if missing, compute and cache it.
-    Use this for super-fast responses after the prewarm runs.
-    """
+async def snapshot_date(date: str = Path(..., pattern=r"^\d{4}-\d{2}-\d{2}$")):
+    """Return cached snapshot for a date; if missing, compute and cache it."""
     try:
         return await get_snapshot(date)
     except Exception as e:
